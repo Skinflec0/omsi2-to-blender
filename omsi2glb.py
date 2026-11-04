@@ -19,8 +19,10 @@ Options
     --bus NAME       which .bus file to use (default: ask / first)
     --cfg NAME       use this model .cfg instead of reading the .bus file
     --all-meshes     ignore the cfg and export every .o3d found
-    --keep-dirt      also export meshes with "dirt" in the name (skipped by default;
-                     they are overlays that sit on top of the body)
+    --keep-dirt      also export dirt / rain overlays (skipped by default): meshes with
+                     "dirt" in the name and material slots such as cldirt.tga / regen.tga.
+                     OMSI fades these in and out with the weather, so a static export
+                     would show them at full strength (e.g. opaque brown windows)
     --exclude TEXT   skip meshes whose file name contains TEXT (repeatable)
     --max-tex N      downscale textures so the longest side is <= N px
                      (default 4096, 0 = never downscale)
@@ -58,6 +60,10 @@ GL_ARRAY_BUFFER, GL_ELEMENT_ARRAY_BUFFER = 34962, 34963
 # Image.LANCZOS moved to Image.Resampling.LANCZOS in newer Pillow versions.
 _LANCZOS = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS')
 
+# Dirt and rain layers are extra material slots that OMSI fades in and out with the weather.
+# A static export would show them at full strength (opaque brown windows), so they are skipped.
+OVERLAY_WORDS = ('dirt', 'dreck', 'schmutz', 'regen', 'wetness', 'rain_')
+
 DEFAULT_MATERIAL = {'diffuse': (0.6, 0.6, 0.6, 1.0), 'specular': (0.0, 0.0, 0.0),
                     'emissive': (0.0, 0.0, 0.0), 'power': 0.0, 'tex': ''}
 
@@ -90,6 +96,12 @@ def _base(name):
 
 def _norm(name):
     return re.sub(r'[^a-z0-9]', '', os.path.splitext(name.lower())[0])
+
+
+def is_overlay(texname, alphascale=''):
+    """True for dirt / rain layers (by texture name or by the variable that fades them)."""
+    text = ('%s %s' % (texname, alphascale)).lower()
+    return any(w in text for w in OVERLAY_WORDS)
 
 
 def _note(lst, item):
@@ -241,7 +253,10 @@ def parse_bus_model(path):
 
 
 def parse_cfg(path):
-    """-> [{'mesh': 'Classic\\\\body.o3d', 'matl': [{'tex': str, 'alpha': int}, ...]}, ...]"""
+    """-> [{'mesh': 'Classic\\\\body.o3d', 'matl': [{'tex': str, 'alpha': int, 'alphascale': str}, ...]}, ...]
+
+    [matl_alpha] sets a slot's transparency mode and [alphascale] names the variable that fades it
+    (dirt and rain layers use this)."""
     lines = _read_text(path).splitlines()
     entries, cur, slot, i = [], None, None, 0
     while i < len(lines):
@@ -260,10 +275,13 @@ def parse_cfg(path):
         elif key == 'matl' and cur is not None:
             p, i = _params(lines, i)
             idx = None
-            if len(p) > 1 and re.fullmatch(r'-?\d+', p[0]):     # tolerate "index, texture"
+            if len(p) > 1 and re.fullmatch(r'-?\d+', p[0]):          # tolerate "index, texture"
                 idx, p = int(p[0]), p[1:]
-            # An empty [matl] still occupies a material slot, so later slots keep their index.
-            slot = {'tex': p[0] if p else '', 'alpha': 0}
+            # OMSI writes "texture name, number" here. What the number means is not confirmed,
+            # so slots are assigned in file order (as before) and the number is only kept.
+            num = int(p[1]) if len(p) > 1 and re.fullmatch(r'-?\d+', p[1]) else None
+            # An empty [matl] still occupies a material slot, so later slots keep their order.
+            slot = {'tex': p[0] if p else '', 'alpha': 0, 'alphascale': '', 'number': num}
             if idx is not None and 0 <= idx < 256:
                 while len(cur['matl']) <= idx:
                     cur['matl'].append(None)
@@ -276,6 +294,9 @@ def parse_cfg(path):
                 slot['alpha'] = int(float(p[0]))
             except (ValueError, IndexError):
                 pass
+        elif key == 'alphascale' and slot is not None:
+            p, i = _params(lines, i)
+            slot['alphascale'] = p[0] if p else ''
     return entries
 
 
@@ -517,8 +538,10 @@ def select_entries(files, folder, bus=None, cfg=None, all_meshes=False, interact
 class Exporter:
     """Turns parsed O3D data into glTF meshes, materials and textures."""
 
-    def __init__(self, files, textures=True, max_tex=4096, alpha_mode='blend'):
+    def __init__(self, files, textures=True, max_tex=4096, alpha_mode='blend', keep_dirt=False):
         self.files = files
+        self.keep_dirt = keep_dirt
+        self.overlays_skipped = 0
         self.textures = textures
         self.max_tex = max_tex
         self.alpha_mode = alpha_mode
@@ -626,19 +649,28 @@ class Exporter:
         tmat = data['tmat']
         if len(data['tris']) == 0:
             return None
+        mats = data['mats'] or [DEFAULT_MATERIAL]
+        keep = []                                   # (material index, o3d material, cfg override)
+        for mi in np.unique(tmat).tolist():
+            m = mats[min(mi, len(mats) - 1)]
+            ov = overrides[mi] if mi < len(overrides) else None
+            if not self.keep_dirt and is_overlay((ov or {}).get('tex') or m['tex'],
+                                                 (ov or {}).get('alphascale', '')):
+                self.overlays_skipped += 1
+                continue
+            keep.append((mi, m, ov))
+        if not keep:
+            return None
         P, N, UV, T = to_gltf_space(data['verts'], data['tris'])
         g = self.glb
         att = {'POSITION': g.accessor(P, 'VEC3', GL_FLOAT, GL_ARRAY_BUFFER, True),
                'NORMAL': g.accessor(N, 'VEC3', GL_FLOAT, GL_ARRAY_BUFFER),
                'TEXCOORD_0': g.accessor(UV, 'VEC2', GL_FLOAT, GL_ARRAY_BUFFER)}
-        mats = data['mats'] or [DEFAULT_MATERIAL]
         prims = []
-        for mi in np.unique(tmat).tolist():
+        for mi, m, ov in keep:
             sel = T[tmat == mi].astype(np.uint32).reshape(-1)
             idx = g.accessor(sel, 'SCALAR', GL_UNSIGNED_INT, GL_ELEMENT_ARRAY_BUFFER)
-            ov = overrides[mi] if mi < len(overrides) else None
-            prims.append({'attributes': att, 'indices': idx,
-                          'material': self.material(mats[min(mi, len(mats) - 1)], ov)})
+            prims.append({'attributes': att, 'indices': idx, 'material': self.material(m, ov)})
         name = os.path.splitext(base)[0]
         g.meshes.append({'name': name, 'primitives': prims})
         g.nodes.append({'name': name, 'mesh': len(g.meshes) - 1})
@@ -656,7 +688,7 @@ def convert(folder, out=None, bus=None, cfg=None, all_meshes=False, keep_dirt=Fa
     entries, source, cfg_dir = select_entries(files, folder, bus, cfg, all_meshes, interactive)
 
     skip_words = [w.lower() for w in exclude] + ([] if keep_dirt else ['dirt'])
-    ex = Exporter(files, textures, max_tex, alpha_mode)
+    ex = Exporter(files, textures, max_tex, alpha_mode, keep_dirt)
     skipped, seen, parts = [], set(), []
 
     for ent in entries:
@@ -701,6 +733,9 @@ def convert(folder, out=None, bus=None, cfg=None, all_meshes=False, keep_dirt=Fa
           % (out, len(parts), len(ex.glb.materials), len(ex.glb.textures)))
     if skipped:
         print('skipped:', ', '.join(skipped))
+    if ex.overlays_skipped:
+        print('skipped %d dirt/rain overlay material slots (use --keep-dirt to include them)'
+              % ex.overlays_skipped)
     if ex.fuzzy:
         print('textures matched by similar name (check these):',
               ', '.join('%s -> %s' % kv for kv in sorted(ex.fuzzy.items())))
@@ -722,7 +757,7 @@ def build_parser():
     ap.add_argument('--bus', metavar='NAME', help='which .bus file to use')
     ap.add_argument('--cfg', metavar='NAME', help='use this model .cfg instead of the .bus file')
     ap.add_argument('--all-meshes', action='store_true', help='ignore the cfg, export every .o3d found')
-    ap.add_argument('--keep-dirt', action='store_true', help='also export meshes with "dirt" in the name')
+    ap.add_argument('--keep-dirt', action='store_true', help='also export dirt / rain overlay meshes and material slots')
     ap.add_argument('--exclude', action='append', default=None, metavar='TEXT',
                     help='skip meshes whose file name contains TEXT (repeatable)')
     ap.add_argument('--max-tex', type=int, default=4096, metavar='N',
