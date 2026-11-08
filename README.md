@@ -1,4 +1,4 @@
-# omsi2glb
+# omsi2-to-blender
 
 Convert **OMSI 2** buses and objects (`.o3d`) into a single **glTF binary (`.glb`)** that opens in
 Blender (and any other glTF viewer) with the parts lined up, textured and facing the right way.
