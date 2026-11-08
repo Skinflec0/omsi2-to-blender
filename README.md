@@ -1,4 +1,3 @@
-```markdown
 # omsi2glb
 
 Convert **OMSI 2** buses and objects (`.o3d`) into a single **glTF binary (`.glb`)** that opens in
@@ -21,7 +20,7 @@ Two small tools, no install step beyond Python, NumPy and Pillow:
 ## Install
 
 ```bash
-git clone https://github.com/<you>/omsi2glb.git
+git clone [https://github.com/](https://github.com/)<you>/omsi2glb.git
 cd omsi2glb
 pip install -r requirements.txt     # numpy + pillow, Python 3.8 or newer
 ```
@@ -108,4 +107,3 @@ their models, textures and cfg files are usually copyrighted by their authors. O
 made or have permission to use, and respect the licence of any bus you redistribute.
 
 The tools themselves are released under the [MIT License](LICENSE).
-```
