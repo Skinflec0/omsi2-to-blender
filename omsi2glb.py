@@ -30,8 +30,8 @@ Options
     --alpha-mode M   how [matl_alpha] materials are exported: "blend" (default,
                      smooth transparency) or "mask" (hard cut-out, no sorting issues)
 
-Supported: O3D version 1 and 2 (verified). Version 3 is attempted and checked
-automatically. Version 4+ files are scrambled/protected and are not supported.
+Supported: O3D versions 1-7. Versions 4+ may be scrambled; the loader undoes the
+scramble when a key is present (key 0xFFFFFFFF means the geometry is stored plainly).
 Needs: Python 3.8+, numpy, Pillow  (pip install numpy pillow)
 Import the .glb in Blender with File > Import > glTF 2.0.
 """
@@ -49,7 +49,7 @@ try:
 except ImportError as _exc:  # pragma: no cover
     sys.exit('missing dependency: %s\nInstall with:  pip install numpy pillow' % _exc.name)
 
-__version__ = '0.2.0'
+__version__ = '0.3.0'
 
 TEX_EXTS = ('.tga', '.dds', '.png', '.bmp', '.jpg', '.jpeg')
 
@@ -178,8 +178,62 @@ def _try_parse(b, start, cw, iw, mw, mcw, strict):
         return None
 
 
+def _unscramble_verts(verts, key, flags, version):
+    """Undo OMSI's per-vertex scramble used on version >= 4 when key != 0xFFFFFFFF.
+
+    Algorithm taken from the openOMSI loader (docs/FORMATS.md). Only the vertex
+    block is scrambled; triangles, materials and the transform matrix are plain.
+    """
+    if key == 0xFFFFFFFF:
+        return verts
+    import math
+    verts = np.array(verts, dtype=np.float32, copy=True)
+    n = int(len(verts) % 0xFDE8)
+    state = (key + version - 4 + (0x17D if (flags & 2) else 0)) % 0xFDE8
+    b = 0
+    for i in range(len(verts)):
+        x, y, z = float(verts[i, 0]), float(verts[i, 1]), float(verts[i, 2])
+        nx, ny, nz = float(verts[i, 3]), float(verts[i, 4]), float(verts[i, 5])
+        u, v = float(verts[i, 6]), float(verts[i, 7])
+        if key == 0:
+            state = 0x130 if (flags & 2) else 0
+        state = (state * n + n * b) % 8000
+        fx = abs(x - math.floor(x))
+        fy = abs(y - math.floor(y))
+        fz = abs(z - math.floor(z))
+        b = int(abs(fx * fy * fz) * 600) % 256
+        if state < 1000:
+            x, y = y, x
+        elif state < 3000:
+            x, z = z, x
+        elif state > 7000:
+            y, z = z, y
+        if state % 4 == 0:
+            nx = -nx
+        if state % 6 == 0:
+            ny = -ny
+        if state % 7 == 0:
+            nz = -nz
+        if state < 600:
+            ny, nz = nz, ny
+        elif state > 4500:
+            nx, ny = ny, nx
+        elif state > 6500:
+            nx, nz = nz, nx
+        if state % 5 == 0:
+            u -= ((state % 100) ** 2) / 10000.0
+        if state % 3 == 0:
+            v -= ((state % 50) ** 2) / 2500.0
+        verts[i] = (x, y, z, nx, ny, nz, u, v)
+    return verts
+
+
 def read_o3d(path):
-    """Read an .o3d file -> dict(verts Nx8, tris Mx3, tmat M, mats [...], version)."""
+    """Read an .o3d file -> dict(verts Nx8, tris Mx3, tmat M, mats [...], version).
+
+    Supports O3D versions 1-7. Versions 4+ may carry a scramble key; when the key
+    is 0xFFFFFFFF the geometry is stored plainly (common for many add-on meshes).
+    """
     try:
         with open(path, 'rb') as f:
             b = f.read()
@@ -188,26 +242,59 @@ def read_o3d(path):
     if len(b) < 8 or b[:2] != b'\x84\x19':
         raise O3DError('not an O3D file')
     ver = b[2]
-    if ver >= 4:
-        raise O3DError('version %d is scrambled/protected and not supported' % ver)
+    if ver > 7:
+        raise O3DError('version %d is too new / not supported' % ver)
+
     if ver <= 2:
         r = _try_parse(b, 3, 2, 2, 2, 2, strict=False)
         if r:
             r['version'] = ver
             return r
         raise O3DError('could not read version %d layout' % ver)
-    # version 3: 32-bit counters; try the plausible layouts, accept only an exact fit
-    for start in range(3, min(len(b), 16)):
-        if b[start] != 0x17:
-            continue
-        for iw in (2, 4):
-            for mw in (2, 4):
-                for mcw in (4, 2):
-                    r = _try_parse(b, start, 4, iw, mw, mcw, strict=True)
-                    if r:
-                        r['version'] = ver
-                        return r
-    raise O3DError('version 3 layout not recognised')
+
+    # version >= 3: optional extended header (flags + key from version 4)
+    flags, key = 0, 0xFFFFFFFF
+    if ver >= 4:
+        if len(b) < 9:
+            raise O3DError('truncated version %d header' % ver)
+        flags = b[3]
+        key = int.from_bytes(b[4:8], 'little')
+        start = 8
+    else:
+        # version 3: try a few possible starts (some files have padding)
+        start = None
+        for s in range(3, min(len(b), 16)):
+            if b[s] == 0x17:
+                start = s
+                break
+        if start is None:
+            raise O3DError('version 3 layout not recognised')
+
+    # Prefer the layout that matches the flags bit (32-bit triangle indices)
+    preferred_iw = 4 if (flags & 1) else 2
+    candidates = [preferred_iw] + [w for w in (2, 4) if w != preferred_iw]
+
+    r = None
+    for iw in candidates:
+        for mw in (2, 4):
+            for mcw in (2, 4):
+                cand = _try_parse(b, start, 4, iw, mw, mcw, strict=False)
+                if cand is not None:
+                    r = cand
+                    break
+            if r is not None:
+                break
+        if r is not None:
+            break
+
+    if r is None:
+        raise O3DError('version %d layout not recognised' % ver)
+
+    if key != 0xFFFFFFFF:
+        r['verts'] = _unscramble_verts(r['verts'], key, flags, ver)
+
+    r['version'] = ver
+    return r
 
 
 # =============================================================================
