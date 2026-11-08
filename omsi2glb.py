@@ -269,7 +269,7 @@ def parse_cfg(path):
         if key == 'mesh':
             p, i = _params(lines, i)
             if p:
-                cur = {'mesh': p[0], 'matl': []}
+                cur = {'mesh': p[0], 'matl': [], 'layers': []}
                 entries.append(cur)
                 slot = None
         elif key == 'matl' and cur is not None:
@@ -277,17 +277,12 @@ def parse_cfg(path):
             idx = None
             if len(p) > 1 and re.fullmatch(r'-?\d+', p[0]):          # tolerate "index, texture"
                 idx, p = int(p[0]), p[1:]
-            # OMSI writes "texture name, number" here. What the number means is not confirmed,
-            # so slots are assigned in file order (as before) and the number is only kept.
+            # OMSI writes "texture name, number" here. The number is the material slot of the
+            # .o3d that the texture goes on; repeated numbers are stacked layers on one slot.
             num = int(p[1]) if len(p) > 1 and re.fullmatch(r'-?\d+', p[1]) else None
             # An empty [matl] still occupies a material slot, so later slots keep their order.
             slot = {'tex': p[0] if p else '', 'alpha': 0, 'alphascale': '', 'number': num}
-            if idx is not None and 0 <= idx < 256:
-                while len(cur['matl']) <= idx:
-                    cur['matl'].append(None)
-                cur['matl'][idx] = slot
-            else:
-                cur['matl'].append(slot)
+            cur['layers'].append((idx if idx is not None else num, slot))
         elif key == 'matl_alpha' and slot is not None:
             p, i = _params(lines, i)
             try:
@@ -297,6 +292,23 @@ def parse_cfg(path):
         elif key == 'alphascale' and slot is not None:
             p, i = _params(lines, i)
             slot['alphascale'] = p[0] if p else ''
+    return _resolve_layers(entries)
+
+
+def _resolve_layers(entries):
+    """Give every .o3d material slot one cfg override: the first layer that is not a
+    dirt / rain overlay (a slot that only has overlay layers keeps one, so it is skipped later)."""
+    for ent in entries:
+        by_slot, nxt = {}, 0
+        for target, slot in ent.pop('layers', []):
+            if target is None or not 0 <= target < 256:
+                target = nxt                     # no usable number: next slot in file order
+            nxt = max(nxt, target + 1)
+            by_slot.setdefault(target, []).append(slot)
+        out = [None] * (max(by_slot) + 1 if by_slot else 0)
+        for t, layers in by_slot.items():
+            out[t] = next((s for s in layers if not is_overlay(s['tex'], s['alphascale'])), layers[0])
+        ent['matl'] = out
     return entries
 
 
@@ -600,6 +612,10 @@ class Exporter:
         alpha = override.get('alpha', 0) > 0
         em = tuple(round(_f(x), 3) for x in m['emissive'])
         diffuse = tuple(round(_f(x), 3) for x in m['diffuse'])
+        # The .o3d material's own alpha (e.g. 0.3 on door glass) is what makes glass see-through.
+        fa = diffuse[3] if 0.02 < diffuse[3] < 0.99 else 1.0
+        if fa < 1.0:
+            alpha = True
 
         path = png = None
         if self.textures and texname:
@@ -615,7 +631,7 @@ class Exporter:
 
         # Untextured materials stay separate per texture name so they can be retextured in Blender.
         key = (os.path.normcase(path) if png else 'missing:' + texname.lower(),
-               alpha, em, None if png else diffuse)
+               alpha, em, None if png else diffuse, fa)
         if key in self._mat:
             return self._mat[key]
 
@@ -624,6 +640,8 @@ class Exporter:
                'pbrMetallicRoughness': pbr}
         if png:
             pbr['baseColorTexture'] = {'index': self.glb.texture(png, key[0], os.path.basename(path))}
+            if fa < 1.0:
+                pbr['baseColorFactor'] = [1.0, 1.0, 1.0, fa]
         else:
             d = [_clamp01(v) for v in diffuse]
             if not any(d[:3]):
@@ -654,6 +672,10 @@ class Exporter:
         for mi in np.unique(tmat).tolist():
             m = mats[min(mi, len(mats) - 1)]
             ov = overrides[mi] if mi < len(overrides) else None
+            hidden = is_overlay(m['tex']) and _f(m['diffuse'][3]) <= 0.02     # rain layer, fully see-through
+            if hidden and not self.keep_dirt:
+                self.overlays_skipped += 1
+                continue
             if not self.keep_dirt and is_overlay((ov or {}).get('tex') or m['tex'],
                                                  (ov or {}).get('alphascale', '')):
                 self.overlays_skipped += 1
@@ -687,7 +709,7 @@ def convert(folder, out=None, bus=None, cfg=None, all_meshes=False, keep_dirt=Fa
     files = index_files(folder)
     entries, source, cfg_dir = select_entries(files, folder, bus, cfg, all_meshes, interactive)
 
-    skip_words = [w.lower() for w in exclude] + ([] if keep_dirt else ['dirt'])
+    skip_words = [w.lower() for w in exclude] + ([] if keep_dirt else ['dirt', 'rain'])
     ex = Exporter(files, textures, max_tex, alpha_mode, keep_dirt)
     skipped, seen, parts = [], set(), []
 
